@@ -55,6 +55,7 @@ public:
   bool shouldDeny(const mesh::Packet* packet, const char** matchedName = NULL) const;
 
   size_t serializePolicy(uint8_t* dest, size_t capacity) const;
+  static bool validateSerializedPolicy(const uint8_t* src, size_t length);
   bool deserializePolicy(const uint8_t* src, size_t length);
 
 private:

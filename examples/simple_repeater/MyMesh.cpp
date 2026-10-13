@@ -1047,12 +1047,11 @@ bool MyMesh::saveChannelPolicy() {
   // write is interrupted or fails, boot-time loading falls back to this copy.
   bool backupReady = false;
   {
-    RepeaterChannelManager previous;
     const char* oldPaths[] = {CHANNEL_POLICY_FILE, CHANNEL_POLICY_BACKUP_FILE};
     for (size_t i = 0; i < sizeof(oldPaths) / sizeof(oldPaths[0]); i++) {
       if (!_fs->exists(oldPaths[i])) continue;
       if (readChannelPolicyFile(_fs, oldPaths[i], data, sizeof(data), &length) &&
-          previous.deserializePolicy(data, length)) {
+          RepeaterChannelManager::validateSerializedPolicy(data, length)) {
         if (strcmp(oldPaths[i], CHANNEL_POLICY_BACKUP_FILE) == 0) {
           backupReady = true;
         } else {
@@ -1060,7 +1059,7 @@ bool MyMesh::saveChannelPolicy() {
           if (backupReady) {
             backupReady = readChannelPolicyFile(_fs, CHANNEL_POLICY_BACKUP_FILE, data,
                                                 sizeof(data), &length) &&
-                          previous.deserializePolicy(data, length);
+                          RepeaterChannelManager::validateSerializedPolicy(data, length);
           }
         }
         if (!backupReady) return false;
@@ -1073,13 +1072,10 @@ bool MyMesh::saveChannelPolicy() {
   if (length == 0) return false;
   if (!writeChannelPolicyFile(_fs, CHANNEL_POLICY_FILE, data, length)) return false;
 
-  {
-    RepeaterChannelManager verified;
-    if (!readChannelPolicyFile(_fs, CHANNEL_POLICY_FILE, data, sizeof(data), &length) ||
-        !verified.deserializePolicy(data, length)) {
-      _fs->remove(CHANNEL_POLICY_FILE);
-      return false;
-    }
+  if (!readChannelPolicyFile(_fs, CHANNEL_POLICY_FILE, data, sizeof(data), &length) ||
+      !RepeaterChannelManager::validateSerializedPolicy(data, length)) {
+    _fs->remove(CHANNEL_POLICY_FILE);
+    return false;
   }
   _fs->remove(CHANNEL_POLICY_BACKUP_FILE);
   return true;
@@ -1465,7 +1461,6 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     }
   } else if (strncmp(command, "channel deny ", 13) == 0) {
     const char* name = command + 13;
-    RepeaterChannelManager previous = channel_manager;
     RepeaterChannelManager::DeniedChannel denied;
     auto result = channel_manager.addDenied(name, &denied);
     if (result == RepeaterChannelManager::ADD_INVALID) {
@@ -1473,21 +1468,20 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else if (result == RepeaterChannelManager::ADD_FULL) {
       strcpy(reply, "Err - deny table full");
     } else if (result == RepeaterChannelManager::ADD_OK && !saveChannelPolicy()) {
-      channel_manager = previous;
+      channel_manager.removeDenied(name);
       strcpy(reply, "Err - policy save failed");
     } else {
       snprintf(reply, CHANNEL_CLI_REPLY_SIZE, "OK - denied %s (%02X)", denied.name, denied.hash);
     }
   } else if (strncmp(command, "channel allow ", 14) == 0) {
     const char* name = command + 14;
-    RepeaterChannelManager previous = channel_manager;
     auto result = channel_manager.removeDenied(name);
     if (result == RepeaterChannelManager::REMOVE_INVALID) {
       strcpy(reply, "Err - invalid channel");
     } else if (result == RepeaterChannelManager::REMOVE_NOT_FOUND) {
       strcpy(reply, "Err - channel not denied");
     } else if (!saveChannelPolicy()) {
-      channel_manager = previous;
+      channel_manager.addDenied(name);
       strcpy(reply, "Err - policy save failed");
     } else {
       snprintf(reply, CHANNEL_CLI_REPLY_SIZE, "OK - allowed %s", name);

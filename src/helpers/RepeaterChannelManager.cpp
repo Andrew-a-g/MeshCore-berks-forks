@@ -225,6 +225,48 @@ size_t RepeaterChannelManager::serializePolicy(uint8_t* dest, size_t capacity) c
   return length;
 }
 
+bool RepeaterChannelManager::validateSerializedPolicy(const uint8_t* src, size_t length) {
+  if (src == NULL || length < 10 || memcmp(src, POLICY_MAGIC, sizeof(POLICY_MAGIC)) != 0 ||
+      src[4] != POLICY_VERSION || src[5] > MAX_DENIED_CHANNELS) {
+    return false;
+  }
+  const size_t recordsLength = 6 + static_cast<size_t>(src[5]) * REPEATER_CHANNEL_NAME_SIZE;
+  if (length != recordsLength + 4) return false;
+  const uint32_t storedCrc = static_cast<uint32_t>(src[recordsLength]) |
+                             (static_cast<uint32_t>(src[recordsLength + 1]) << 8) |
+                             (static_cast<uint32_t>(src[recordsLength + 2]) << 16) |
+                             (static_cast<uint32_t>(src[recordsLength + 3]) << 24);
+  if (storedCrc != policyCrc32(src, recordsLength)) return false;
+
+  for (size_t i = 0; i < src[5]; i++) {
+    const size_t offset = 6 + i * REPEATER_CHANNEL_NAME_SIZE;
+    const char* name = reinterpret_cast<const char*>(&src[offset]);
+    const void* terminator = memchr(name, 0, REPEATER_CHANNEL_NAME_SIZE);
+    if (terminator == NULL) return false;
+    const size_t nameLength = static_cast<const char*>(terminator) - name;
+    for (size_t j = nameLength + 1; j < REPEATER_CHANNEL_NAME_SIZE; j++) {
+      if (src[offset + j] != 0) return false;
+    }
+
+    if (strcmp(name, PUBLIC_CHANNEL_POLICY_NAME) != 0) {
+      if (name[0] != '#' || nameLength < 2 || nameLength >= REPEATER_CHANNEL_NAME_SIZE) {
+        return false;
+      }
+      for (size_t j = 1; j < nameLength; j++) {
+        const uint8_t value = static_cast<uint8_t>(name[j]);
+        if (value < 0x20 || value == 0x7F) return false;
+      }
+    }
+
+    for (size_t previous = 0; previous < i; previous++) {
+      const char* previousName = reinterpret_cast<const char*>(
+          &src[6 + previous * REPEATER_CHANNEL_NAME_SIZE]);
+      if (strcmp(name, previousName) == 0) return false;
+    }
+  }
+  return true;
+}
+
 bool RepeaterChannelManager::deserializePolicy(const uint8_t* src, size_t length) {
   clearDenied();
   if (src == NULL || length < 10 || memcmp(src, POLICY_MAGIC, sizeof(POLICY_MAGIC)) != 0 ||

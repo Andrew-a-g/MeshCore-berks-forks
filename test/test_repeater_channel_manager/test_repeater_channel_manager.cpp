@@ -31,6 +31,34 @@ mesh::Packet publicGroupPacket(uint8_t type = PAYLOAD_TYPE_GRP_TXT) {
                                         0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72};
   return groupPacketWithKey(key, 0x11, type);
 }
+
+uint32_t policyCrc32(const uint8_t* data, size_t length) {
+  uint32_t crc = 0xFFFFFFFFU;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320U & (0U - (crc & 1U)));
+    }
+  }
+  return ~crc;
+}
+
+void refreshPolicyCrc(uint8_t* policy, size_t length) {
+  ASSERT_GE(length, 4U);
+  const size_t crcOffset = length - 4;
+  const uint32_t crc = policyCrc32(policy, crcOffset);
+  policy[crcOffset] = static_cast<uint8_t>(crc);
+  policy[crcOffset + 1] = static_cast<uint8_t>(crc >> 8);
+  policy[crcOffset + 2] = static_cast<uint8_t>(crc >> 16);
+  policy[crcOffset + 3] = static_cast<uint8_t>(crc >> 24);
+}
+
+void expectPolicyValidationParity(const uint8_t* policy, size_t length, bool expected) {
+  RepeaterChannelManager manager;
+  const bool deserialized = manager.deserializePolicy(policy, length);
+  EXPECT_EQ(expected, deserialized);
+  EXPECT_EQ(deserialized, RepeaterChannelManager::validateSerializedPolicy(policy, length));
+}
 } // namespace
 
 TEST(RepeaterChannelManagerTest, DerivesDocumentedPublicChannel) {
@@ -183,6 +211,91 @@ TEST(RepeaterChannelManagerTest, DenyMutationsAreExactBoundedAndIdempotent) {
   }
   EXPECT_EQ(RepeaterChannelManager::ADD_FULL, manager.addDenied("#overflow"));
   EXPECT_EQ(MAX_DENIED_CHANNELS, manager.getDeniedCount());
+}
+
+TEST(RepeaterChannelManagerTest, InverseMutationsRestoreDeniedState) {
+  RepeaterChannelManager manager;
+
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("#new"));
+  ASSERT_EQ(RepeaterChannelManager::REMOVE_OK, manager.removeDenied("#new"));
+  EXPECT_EQ(0U, manager.getDeniedCount());
+
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("#existing"));
+  ASSERT_EQ(RepeaterChannelManager::REMOVE_OK, manager.removeDenied("#existing"));
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("#existing"));
+  EXPECT_EQ(1U, manager.getDeniedCount());
+  EXPECT_EQ(RepeaterChannelManager::ADD_EXISTS, manager.addDenied("#existing"));
+  EXPECT_EQ(1U, manager.getDeniedCount());
+}
+
+TEST(RepeaterChannelManagerTest, SerializedPolicyValidatorMatchesDeserializer) {
+  uint8_t empty[REPEATER_CHANNEL_POLICY_MAX_SIZE];
+  RepeaterChannelManager manager;
+  size_t emptyLength = manager.serializePolicy(empty, sizeof(empty));
+  ASSERT_GT(emptyLength, 0U);
+  expectPolicyValidationParity(empty, emptyLength, true);
+
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("#one"));
+  uint8_t single[REPEATER_CHANNEL_POLICY_MAX_SIZE];
+  size_t singleLength = manager.serializePolicy(single, sizeof(single));
+  ASSERT_GT(singleLength, 0U);
+  expectPolicyValidationParity(single, singleLength, true);
+
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("#two"));
+  ASSERT_EQ(RepeaterChannelManager::ADD_OK, manager.addDenied("public"));
+  uint8_t valid[REPEATER_CHANNEL_POLICY_MAX_SIZE];
+  size_t validLength = manager.serializePolicy(valid, sizeof(valid));
+  ASSERT_GT(validLength, 0U);
+  expectPolicyValidationParity(valid, validLength, true);
+
+  RepeaterChannelManager fullManager;
+  for (int i = 0; i < MAX_DENIED_CHANNELS; i++) {
+    char name[20];
+    snprintf(name, sizeof(name), "#channel%d", i);
+    ASSERT_EQ(RepeaterChannelManager::ADD_OK, fullManager.addDenied(name));
+  }
+  uint8_t full[REPEATER_CHANNEL_POLICY_MAX_SIZE];
+  const size_t fullLength = fullManager.serializePolicy(full, sizeof(full));
+  ASSERT_EQ(sizeof(full), fullLength);
+  expectPolicyValidationParity(full, fullLength, true);
+
+  uint8_t fixture[REPEATER_CHANNEL_POLICY_MAX_SIZE];
+  memcpy(fixture, valid, validLength);
+  fixture[0] ^= 1;
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  fixture[4]++;
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  fixture[5] = MAX_DENIED_CHANNELS + 1;
+  expectPolicyValidationParity(fixture, validLength, false);
+  expectPolicyValidationParity(valid, validLength - 1, false);
+
+  memcpy(fixture, valid, validLength);
+  fixture[validLength - 1] ^= 1;
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  memset(&fixture[6], 'x', REPEATER_CHANNEL_NAME_SIZE);
+  refreshPolicyCrc(fixture, validLength);
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  fixture[6 + strlen("#one") + 1] = 'x';
+  refreshPolicyCrc(fixture, validLength);
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  fixture[6] = 'x';
+  refreshPolicyCrc(fixture, validLength);
+  expectPolicyValidationParity(fixture, validLength, false);
+
+  memcpy(fixture, valid, validLength);
+  memcpy(&fixture[6 + REPEATER_CHANNEL_NAME_SIZE], &fixture[6], REPEATER_CHANNEL_NAME_SIZE);
+  refreshPolicyCrc(fixture, validLength);
+  expectPolicyValidationParity(fixture, validLength, false);
 }
 
 TEST(RepeaterChannelManagerTest, PolicyRoundTripDoesNotPersistSeenState) {
